@@ -6,6 +6,7 @@ services:
       -s3-bucket uploads
       -s3-endpoint http://minio:9000
       -s3-disable-ssl
+      -hooks-http http://app:8000/tusd_hook
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin123
@@ -36,13 +37,30 @@ services:
       "
     depends_on: [minio]
 
+  db: # PostgreSQL database for task metadata
+    image: postgres:16
+    environment:
+      POSTGRES_USER: tus
+      POSTGRES_PASSWORD: tuspass
+      POSTGRES_DB: tasks
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tus -d tasks"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports: ["5432:5432"]
+
   app: # Main application server
     build: ./app
     depends_on: [minio]
     shm_size: 64gb
     environment:
-      TUS_ENDPOINT: http://tusd:1080/files
-      MINIO_ENDPOINT:  http://192.168.1.26:9000 # Pretend this is a remote server
+      DATABASE_URL: postgresql+psycopg2://tus:tuspass@db:5432/tasks
+      TUS_ENDPOINT: http://192.168.1.26:1080/files # Pretend this is a remote server
+      MINIO_ENDPOINT:  http://192.168.1.26:9000    # Pretend this is a remote server
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin123
       AWS_S3_ADDRESSING_STYLE: path
@@ -58,3 +76,4 @@ services:
 
 volumes:
   minio_data:
+  pgdata:
