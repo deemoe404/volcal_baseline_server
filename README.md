@@ -1,9 +1,9 @@
 # Task Orchestrator
 
-This repository provides a small FastAPI service that manages `volcal_baseline` tasks.  It
-handles file uploads through [tusd](https://github.com/tus/tusd), stores task metadata in
-PostgreSQL and keeps result files in MinIO.  Heavy processing is executed in a background
-thread so that the API remains responsive.
+This repository provides a small FastAPI service that manages `volcal_baseline` tasks. 
+This is useful when porting the pipeline to some edge embedded devices like DJI remotes or 
+mobile phones. It handles file uploads through [tusd](https://github.com/tus/tusd), stores 
+task metadata in PostgreSQL and keeps result files in MinIO.
 
 ## Features
 
@@ -14,11 +14,15 @@ thread so that the API remains responsive.
 
 ## Getting Started
 
+> Before getting started, please review the environment variables in `docker-compose.yml`,
+> particularly for the `app` container. Ensure that any private IP addresses are updated
+> to reflect your actual server address.
+
 The easiest way to run the service is with Docker Compose:
 
 ```bash
 # clone the repository
-git clone <this repo>
+git clone --recurse-submodules https://github.com/deemoe404/volcal_baseline_server.git
 cd volcal_baseline_server
 
 # start all services
@@ -47,18 +51,71 @@ When running with Docker Compose these values are set automatically.
 ### `POST /create_task`
 Creates a new task and returns four upload URLs (`pre`, `post`, `shp`, `shx`).  Each URL is a
 TUS endpoint where the corresponding file can be uploaded.
+- **`INPUT`**
+  - `None` This endpoint does not require any input.
+- **`OUTPUT`**
+  - `200 OK` The task has been successfully created and is ready to receive file uploads.
+    ```json
+    {
+      "id": "<task_id>",
+      "upload_urls": {
+        "pre":  "<URL>", "post": "<URL>", "shp":  "<URL>", "shx":  "<URL>"
+      }
+    }
+    ```
+    - `id` Task UUID. You can use this ID to query task info later.
+    - `upload_urls` A dictionary of TUS upload endpoints:
+      - `pre` **Reference** point cloud (unchanged scan).
+      - `post` **Target** point cloud (changed scan).
+      - `shp` **Stable Area** shapefile (.shp).
+      - `shx` **Stable Area** index file (.shx).
 
 ### `POST /start_task/{task_id}`
-Marks a task ready for processing once all uploads are finished.  If files are missing the
-response lists which ones are still required.
+>This endpoint exists to support potential future features.
+
+Marks a task as ready for processing once all uploads are complete.  If any files are missing, the response will list the ones that are still required.
+Normally, you won't need to call this API manually, as the task starts automatically once all four files are successfully uploaded.
+- **`INPUT`**
+  - `task_id` The UUID of the task to start.
+- **`OUTPUT`**
+  - `200 OK` The task successfully started or already pending/running.
+    ```json
+    { "started": true }
+    ```
+  - `400 Bad Request` Some required files are still missing.
+    ```json
+    { "missing": "<lable1>", "<lable2>", "..." }
+    ```
+  - `404 Not Found` Invalid task ID.
+    ```json
+    { "detail": "Task not found" }
+    ```
 
 ### `GET /query_task/{task_id}`
 Returns the current status of a task.  When processing is complete the response contains the
 result structure with presigned URLs to any generated images.
-
-### `POST /tusd_hook`
-Internal endpoint called by `tusd` after an upload succeeds.  It updates the task and will
-start processing automatically when every file has been uploaded.
+- **`INPUT`**
+  - `task_id` The UUID of the task to query.
+- **`OUTPUT`**
+  - `200 OK` The task exists and statue is returned.
+    ```json
+    {
+      "status": "done",
+      "results": {
+        "hulls": [
+          {
+            "score": 0.94,
+            "image_url": "<presigned_url>",
+            "..." : "..."
+          },
+          "..."
+        ]
+      }
+    }
+    ```
+    - `status` Task status (`waiting`, `pending`, `running`, `done`, or `error`. See [Task Statuses](#task-statuses) for more details.)
+    - `results` Present only when `status` is `done`. Contains details for each detected hull, along with corresponding presigned image URLs.
+  - `404 Not Found` Invalid task ID.
 
 ## Task Statuses
 
