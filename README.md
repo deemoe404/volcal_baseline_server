@@ -5,6 +5,8 @@ This is useful when porting the pipeline to some edge embedded devices like DJI 
 mobile phones. It handles file uploads through [tusd](https://github.com/tus/tusd), stores 
 task metadata in PostgreSQL and keeps result files in MinIO.
 
+This project relies on the core system specifications defined in [volcal_baseline](https://github.com/deemoe404/volcal_baseline).
+
 ## Features
 
 - **Asynchronous uploads** via the TUS protocol (handled by `tusd`).
