@@ -14,7 +14,7 @@ This project relies on the core system specifications defined in [volcal_baselin
 - **PostgreSQL** for task information and status tracking.
 - **MinIO / S3** for storing processed assets with presigned download links.
 
-## Getting Started
+## Getting Started (Linux/GPU)
 
 > Before getting started, please review the environment variables in `docker-compose.yml`,
 > particularly for the `app` container. Ensure that any private IP addresses are updated
@@ -35,6 +35,42 @@ The compose file starts the API server, a PostgreSQL container, `tusd` for uploa
 local MinIO instance.  After the containers are ready the API will be available on
 `http://localhost:8000`.
 
+## Getting Started (macOS Apple Silicon, MPS-first)
+
+On macOS, keep infra (`db/minio/tusd`) in Docker and run the FastAPI app locally in a
+Python 3.11 virtual environment so Torch can use `mps`.
+
+Prerequisites:
+
+- Docker Desktop
+- Homebrew
+- `python3.11`
+- `cmake`
+- `libomp` (`brew install libomp`)
+
+One-command startup:
+
+```bash
+cd volcal_baseline_server
+chmod +x scripts/dev_up_macos.sh scripts/dev_down_macos.sh
+
+# Use your LAN IP so Android can reach all endpoints.
+scripts/dev_up_macos.sh --public-host 192.168.1.26
+```
+
+Stop everything:
+
+```bash
+scripts/dev_down_macos.sh
+```
+
+The startup script does all of the following:
+
+1. Starts `db/minio/mc-init/tusd` via `docker compose -f docker-compose.yml -f docker-compose.macos.yml`.
+2. Creates/uses `.venv-macos`.
+3. Installs app dependencies and builds `py4dgeo` with `OpenMP_ROOT=$(brew --prefix libomp)`.
+4. Runs `uvicorn` locally on `0.0.0.0:8000`.
+
 ### Environment Variables
 
 The application relies on the following variables (defaults are provided in the compose
@@ -45,8 +81,26 @@ file):
 - `MINIO_ENDPOINT` – MinIO/S3 endpoint used for results
 - `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY`
 - `AWS_S3_ADDRESSING_STYLE` – usually `path`
+- `TORCH_DEVICE` – `auto|mps|cpu|cuda` (default: `auto`)
+- `TORCH_FALLBACK_CHAIN` – comma separated fallback order (default on macOS: `mps,cpu`)
+- `PUBLIC_HOST` – host/IP used to construct externally reachable endpoints for Android
+- `VOLCAL_NUM_WORKERS` – EGS dataloader workers (`0` on macOS by default)
+- `VOLCAL_MAX_ITER` – max iterations for GICP (`768` on macOS by default)
+- `VOLCAL_STABLE_COREPOINT_STRIDE` – stride for stable-area M3C2 corepoints (`4` on macOS)
+- `VOLCAL_MAX_COREPOINTS` – cap for M3C2 corepoints after downsampling (`120000` on macOS)
+- `VOLCAL_NONROI_SAMPLE_STEP` – visualization subsampling for non-ROI points (`400` on macOS)
 
 When running with Docker Compose these values are set automatically.
+
+## Android Client Addressing
+
+The Android app and backend must use a consistent host value:
+
+- Android base URL: `http://<PUBLIC_HOST>:8000/`
+- `TUS_ENDPOINT`: `http://<PUBLIC_HOST>:1080/files`
+- `MINIO_ENDPOINT`: `http://<PUBLIC_HOST>:9000`
+
+If these three do not point to the same reachable host/IP, uploads or image previews will fail.
 
 ## API Overview
 

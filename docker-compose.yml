@@ -59,8 +59,8 @@ services:
     shm_size: 64gb
     environment:
       DATABASE_URL: postgresql+psycopg2://tus:tuspass@db:5432/tasks
-      TUS_ENDPOINT: http://192.168.1.26:1080/files # Pretend this is a remote server
-      MINIO_ENDPOINT:  http://192.168.1.26:9000    # Pretend this is a remote server
+      TUS_ENDPOINT: ${TUS_ENDPOINT:-http://192.168.1.26:1080/files}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://192.168.1.26:9000}
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin123
       AWS_S3_ADDRESSING_STYLE: path

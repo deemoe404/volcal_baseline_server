@@ -14,16 +14,22 @@ Environment variables expected (see docker-compose):
     MINIO_ACCESS_KEY    minioadmin
     MINIO_SECRET_KEY    minioadmin123
     AWS_S3_ADDRESSING_STYLE path
+    TORCH_DEVICE        auto|mps|cpu|cuda (default: auto)
+    TORCH_FALLBACK_CHAIN comma separated fallback order
 """
 from __future__ import annotations
 
 import base64
 import io
+import logging
+import math
 import os
 import queue
 import threading
 import time
 import uuid
+import gc
+import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from pathlib import Path
@@ -57,16 +63,42 @@ import py4dgeo
 import open3d as o3d
 import volcal_baseline.pipeline as pipeline
 import requests
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+
+from runtime_device import (
+    next_available_fallback,
+    parse_fallback_chain,
+    resolve_torch_device,
+    should_retry_on_mps_error,
+)
 
 # ────────────────────────────── settings ────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL")
 TUS_ENDPOINT = os.getenv("TUS_ENDPOINT")
+PUBLIC_HOST = os.getenv("PUBLIC_HOST")
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT")
+
+if not TUS_ENDPOINT and PUBLIC_HOST:
+    TUS_ENDPOINT = f"http://{PUBLIC_HOST}:1080/files"
+
+if not MINIO_ENDPOINT and PUBLIC_HOST:
+    MINIO_ENDPOINT = f"http://{PUBLIC_HOST}:9000"
+
+LOGGER = logging.getLogger("volcal.task_orchestrator")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is required")
+if not TUS_ENDPOINT:
+    raise RuntimeError("TUS_ENDPOINT is required (or set PUBLIC_HOST)")
+if not MINIO_ENDPOINT:
+    raise RuntimeError("MINIO_ENDPOINT is required (or set PUBLIC_HOST)")
 
 s3_client = boto3.client(
     "s3",
-    endpoint_url=os.getenv("MINIO_ENDPOINT"),
+    endpoint_url=MINIO_ENDPOINT,
     aws_access_key_id=os.getenv("MINIO_ACCESS_KEY"),
     aws_secret_access_key=os.getenv("MINIO_SECRET_KEY"),
     config=Config(
@@ -75,20 +107,92 @@ s3_client = boto3.client(
     ),
 )
 
-DEVICE = torch.device("cuda:{}".format(0))
+
+def _env_int(name: str, default: int, *, min_value: int | None = None) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError:
+        LOGGER.warning("Invalid integer for %s=%r, falling back to %s", name, raw, default)
+        return default
+
+    if min_value is not None and value < min_value:
+        LOGGER.warning(
+            "Value for %s=%s is below minimum %s, using %s",
+            name,
+            value,
+            min_value,
+            default,
+        )
+        return default
+    return value
+
+
+def _env_float(name: str, default: float, *, min_value: float | None = None) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        value = float(raw)
+    except ValueError:
+        LOGGER.warning("Invalid float for %s=%r, falling back to %s", name, raw, default)
+        return default
+
+    if min_value is not None and value < min_value:
+        LOGGER.warning(
+            "Value for %s=%s is below minimum %s, using %s",
+            name,
+            value,
+            min_value,
+            default,
+        )
+        return default
+    return value
+
+REQUESTED_TORCH_DEVICE = os.getenv("TORCH_DEVICE", "auto")
+TORCH_FALLBACK_CHAIN = parse_fallback_chain(os.getenv("TORCH_FALLBACK_CHAIN"))
+PRIMARY_COMPUTE_DEVICE = resolve_torch_device(
+    REQUESTED_TORCH_DEVICE, TORCH_FALLBACK_CHAIN, torch
+)
+IS_MACOS = sys.platform == "darwin"
+
 PADDING = "same"
-VOXEL_SIZE = 2.0
+VOXEL_SIZE = _env_float("VOLCAL_VOXEL_SIZE", 2.0, min_value=0.01)
 PV = 5
 NV = -1
 PPV = -1
-NUM_WORKERS = 24
+NUM_WORKERS = _env_int("VOLCAL_NUM_WORKERS", 0 if IS_MACOS else 24, min_value=0)
 ROTATION_CHOICE = "gen"
 QUANTILE_THR = 0.2
 ICP_VERSION = "generalized"
-MAX_ITER = 2048
-REF_RATIO = 0.01
+MAX_ITER = _env_int("VOLCAL_MAX_ITER", 768 if IS_MACOS else 2048, min_value=1)
+REF_RATIO = _env_float("VOLCAL_REF_RATIO", 0.01, min_value=0.0001)
+STABLE_COREPOINT_STRIDE = _env_int(
+    "VOLCAL_STABLE_COREPOINT_STRIDE", 4 if IS_MACOS else 1, min_value=1
+)
+MAX_COREPOINTS = _env_int("VOLCAL_MAX_COREPOINTS", 120000 if IS_MACOS else 0, min_value=0)
+NONROI_SAMPLE_STEP = _env_int("VOLCAL_NONROI_SAMPLE_STEP", 400 if IS_MACOS else 100, min_value=1)
 
 CHUNK_SIZE   = 10 * 1024 * 1024
+
+LOGGER.info(
+    (
+        "Torch runtime requested=%s selected=%s fallback=%s "
+        "num_workers=%s max_iter=%s stable_stride=%s max_corepoints=%s nonroi_step=%s"
+    ),
+    REQUESTED_TORCH_DEVICE,
+    PRIMARY_COMPUTE_DEVICE,
+    ",".join(TORCH_FALLBACK_CHAIN),
+    NUM_WORKERS,
+    MAX_ITER,
+    STABLE_COREPOINT_STRIDE,
+    MAX_COREPOINTS,
+    NONROI_SAMPLE_STEP,
+)
 
 # ────────────────────────────── database ────────────────────────────────
 engine = create_engine(DATABASE_URL, pool_size=10, max_overflow=20, echo=False)
@@ -245,6 +349,54 @@ TASK_QUEUE: "queue.Queue[str]" = queue.Queue()
 shutdown_flag = threading.Event()
 
 
+def run_egs_with_fallback(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, str]:
+    device = PRIMARY_COMPUTE_DEVICE
+
+    try:
+        transform = pipeline.EGS(
+            source=source,
+            target=target,
+            voxel_size=VOXEL_SIZE,
+            padding=PADDING,
+            ppv=PPV,
+            pv=PV,
+            nv=NV,
+            num_workers=NUM_WORKERS,
+            rotation_choice=ROTATION_CHOICE,
+            rotation_root_path="volcal_baseline/exhaustive-grid-search/data/rotations",
+            device=device,
+        )
+        return transform, device
+    except RuntimeError as exc:
+        if not should_retry_on_mps_error(exc, device):
+            raise
+
+        fallback_device = next_available_fallback(device, TORCH_FALLBACK_CHAIN, torch)
+        if fallback_device is None:
+            raise
+
+        LOGGER.warning(
+            "EGS failed on %s and is retrying on %s: %s",
+            device,
+            fallback_device,
+            exc,
+        )
+        transform = pipeline.EGS(
+            source=source,
+            target=target,
+            voxel_size=VOXEL_SIZE,
+            padding=PADDING,
+            ppv=PPV,
+            pv=PV,
+            nv=NV,
+            num_workers=NUM_WORKERS,
+            rotation_choice=ROTATION_CHOICE,
+            rotation_root_path="volcal_baseline/exhaustive-grid-search/data/rotations",
+            device=fallback_device,
+        )
+        return transform, fallback_device
+
+
 def heavy_processing(task: Task, db: Session):
     """Placeholder for heavy 3-D processing pipeline.
     Adapt it to call your existing pipeline functions and populate `task.result`.
@@ -274,18 +426,8 @@ def heavy_processing(task: Task, db: Session):
         source = np.vstack((x4_trans, y4_trans, z4_trans)).T
         target = np.vstack((x1, y1, z1)).T
         
-        EGS_T = pipeline.EGS(
-            source=source,
-            target=target,
-            voxel_size=VOXEL_SIZE,
-            padding=PADDING,
-            ppv=PPV,
-            pv=PV,
-            nv=NV,
-            num_workers=NUM_WORKERS,
-            rotation_choice=ROTATION_CHOICE,
-            rotation_root_path="volcal_baseline/exhaustive-grid-search/data/rotations",
-        )
+        EGS_T, egs_device = run_egs_with_fallback(source=source, target=target)
+        LOGGER.info("Task %s EGS ran on device %s", task.id, egs_device)
         
         GICP_T = pipeline.auto_GICP(
             source=source, target=target, T_init=EGS_T, thr=QUANTILE_THR, max_iter=MAX_ITER
@@ -303,11 +445,9 @@ def heavy_processing(task: Task, db: Session):
         avg_spacing = pipeline.estimate_avg_spacing(target)
         init_voxel_size = avg_spacing / REF_RATIO
         adapted_voxel_size = pipeline.adaptive_voxel_size(target, REF_RATIO, init_voxel_size, 25, 15, 1)
-        down_source = pipeline.voxel_downsample(target, adapted_voxel_size)
-        
         m3c2 = py4dgeo.M3C2(
             epochs=(epoch_stable_before, epoch_stable_after),
-            corepoints=epoch_stable_before.cloud[::],
+            corepoints=epoch_stable_before.cloud[::STABLE_COREPOINT_STRIDE],
             normal_radii=(adapted_voxel_size * 2.0,),
             cyl_radius=(adapted_voxel_size),
             max_distance=(15.0),
@@ -323,6 +463,16 @@ def heavy_processing(task: Task, db: Session):
         corepoints_pcd.points = o3d.utility.Vector3dVector(epoch_before.cloud)
         corepoints_pcd        = corepoints_pcd.voxel_down_sample(voxel_size=adapted_voxel_size)#0.1)
         corepoints            = np.asarray(corepoints_pcd.points)
+        if MAX_COREPOINTS > 0 and corepoints.shape[0] > MAX_COREPOINTS:
+            stride = max(1, math.ceil(corepoints.shape[0] / MAX_COREPOINTS))
+            LOGGER.info(
+                "Task %s reducing M3C2 corepoints from %s to %s (stride=%s)",
+                task.id,
+                corepoints.shape[0],
+                corepoints[::stride].shape[0],
+                stride,
+            )
+            corepoints = corepoints[::stride]
 
         m3c2 = py4dgeo.M3C2(
             epochs=(epoch_before, epoch_after),
@@ -364,7 +514,7 @@ def heavy_processing(task: Task, db: Session):
 
             filtered_raw_roi      = target[inside_raw]
             unfiltered_raw_other  = target[mask_combined][::100]
-            filtered_raw_nonroi   = target[inside_nonroi_raw]
+            filtered_raw_nonroi   = target[inside_nonroi_raw][::NONROI_SAMPLE_STEP]
 
             fig, ax = plt.subplots(subplot_kw={"projection": "3d"}, figsize=(7, 5))
             ax.scatter(filtered_raw_roi[:, 0], filtered_raw_roi[:, 1], filtered_raw_roi[:, 2],
@@ -403,6 +553,11 @@ def heavy_processing(task: Task, db: Session):
         task.error = str(exc)
         task.finished_at = datetime.utcnow()
     finally:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
         db.add(task)
         db.commit()
 
